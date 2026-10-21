@@ -27,6 +27,51 @@ from .domain import CSV_COLUMNS, empty_annotation, make_csv
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger("skin_ai_collector")
 MAX_PIXELS = 40_000_000
+DEFAULT_RETENTION_POLICY = "Photos are retained until a researcher deletes them or the study retention period ends."
+
+
+def collection_is_ready() -> bool:
+    """Fail closed when consent details or production storage have not been verified."""
+    if not settings.collection_enabled:
+        return False
+
+    contact = settings.consent_contact.strip()
+    contact_lower = contact.lower()
+    if (not contact or "update this contact" in contact_lower or "your email" in contact_lower
+            or contact_lower.endswith(("@example.com", "@example.test", "@example.org"))):
+        return False
+    retention = settings.retention_policy.strip()
+    if (not retention or retention == DEFAULT_RETENTION_POLICY
+            or any(marker in retention.lower() for marker in ("todo", "tbd", "replace this", "update this"))):
+        return False
+    if settings.minimum_age < 18 or not settings.consent_version.strip():
+        return False
+
+    # Development tests use mocked storage. Production requires durable metadata,
+    # OAuth credentials, a valid token, and an admin-verified private Drive folder.
+    if settings.app_env != "production":
+        return True
+    if (not settings.database_url.startswith(("postgres://", "postgresql://"))
+            or not settings.google_client_id or not settings.google_client_secret
+            or not settings.allowed_origin.startswith("https://")):
+        return False
+    try:
+        with connect() as db:
+            db.execute("SELECT 1").fetchone()
+            saved_folder = db.execute(
+                "SELECT setting_value FROM app_settings WHERE setting_key='drive_folder_id'"
+            ).fetchone()
+            verified_folder = db.execute(
+                "SELECT setting_value FROM app_settings WHERE setting_key='drive_verified_folder_id'"
+            ).fetchone()
+        folder_id = settings.drive_folder_id or (saved_folder["setting_value"] if saved_folder else "")
+        if not folder_id or not verified_folder or verified_folder["setting_value"] != folder_id:
+            return False
+        drive.credentials()
+    except Exception as exc:
+        logger.info("Collection readiness check failed (%s)", type(exc).__name__)
+        return False
+    return True
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -75,8 +120,7 @@ def health():
 
 @app.get("/api/public-config")
 def public_config():
-    configured = (settings.collection_enabled and "Update this contact" not in settings.consent_contact
-                  and bool(settings.retention_policy.strip()))
+    configured = collection_is_ready()
     return {"consentVersion": settings.consent_version, "minimumAge": settings.minimum_age,
             "contact": settings.consent_contact, "retention": settings.retention_policy,
             "maxUploadBytes": settings.max_upload_bytes, "ready": configured}
@@ -157,6 +201,8 @@ def google_callback(request: Request, state: str = "", code: str = "", error: st
             raise DriveNotReady("Google did not return offline access. Reconnect and approve access.")
         drive.save_credentials(creds)
         folder_id = drive.find_or_create_folder()
+        with transaction() as db:
+            db.execute("DELETE FROM app_settings WHERE setting_key='drive_verified_folder_id'")
         request.session["drive_connected"] = True
         request.session["drive_folder_id"] = folder_id
     except Exception as exc:
@@ -171,9 +217,15 @@ def verify_drive(request: Request, _: str = Depends(require_researcher)):
     require_same_origin(request)
     try:
         result = drive.verify_folder()
+        with transaction() as db:
+            db.execute("INSERT INTO app_settings(setting_key,setting_value) VALUES('drive_verified_folder_id',?) "
+                       "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value",
+                       (result["folder_id"],))
         # The folder ID is an administrative setting, but not exposed to the public site.
-        return result
+        return {key: value for key, value in result.items() if key != "folder_id"}
     except Exception as exc:
+        with transaction() as db:
+            db.execute("DELETE FROM app_settings WHERE setting_key='drive_verified_folder_id'")
         logger.warning("Drive verification failed (%s)", type(exc).__name__)
         raise HTTPException(status_code=503, detail="Google Drive is unavailable or authorization needs attention.")
 
@@ -241,8 +293,7 @@ async def submit_photo(request: Request, image: UploadFile = File(...), consent_
                        consent_id: str = Form(...),
                        idempotency_key: str = Header(..., alias="Idempotency-Key")):
     require_same_origin(request)
-    if (not settings.collection_enabled or "Update this contact" in settings.consent_contact
-            or not settings.retention_policy.strip()):
+    if not collection_is_ready():
         raise HTTPException(status_code=503, detail="Photo collection is not enabled yet. Please try again later.")
     if not consent_confirmed or not adult_confirmed or consent_version != settings.consent_version:
         raise HTTPException(status_code=400, detail="Current consent and adult confirmation are required.")

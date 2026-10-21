@@ -1,4 +1,5 @@
 from io import BytesIO
+from dataclasses import replace
 
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -11,6 +12,46 @@ def make_image():
     output = BytesIO()
     image.save(output, format="JPEG")
     return output.getvalue()
+
+
+def test_collection_gate_fails_closed_for_incomplete_consent_and_production_storage(monkeypatch):
+    assert main.collection_is_ready()
+
+    monkeypatch.setattr(main, "settings", replace(main.settings, consent_contact="Update this contact before collecting submissions"))
+    assert not main.collection_is_ready()
+
+    production = replace(
+        main.settings,
+        app_env="production",
+        collection_enabled=True,
+        consent_contact="study-owner@study.invalid",
+        retention_policy="Delete records when the study ends.",
+        database_url="sqlite:///./data/test.db",
+        google_client_id="configured-client-id",
+        google_client_secret="configured-client-secret",
+        allowed_origin="https://imagecollector.vercel.app",
+    )
+    monkeypatch.setattr(main, "settings", production)
+    assert not main.collection_is_ready()
+
+
+def test_drive_folder_verification_is_recorded_without_exposing_folder_id(monkeypatch):
+    monkeypatch.setattr(main.drive, "verify_folder", lambda: {
+        "connected": True, "folder_id": "test-private-folder-id", "folder_name": "test",
+        "can_upload": True, "can_list": True, "verification_file_removed": True,
+    })
+    with TestClient(main.app) as client:
+        client.post("/api/admin/login", headers={"Origin": "http://testserver"}, json={
+            "username": "test-researcher", "password": "test-password-12345",
+        })
+        verified = client.post("/api/admin/google-drive/verify", headers={"Origin": "http://testserver"})
+        assert verified.status_code == 200
+        assert "folder_id" not in verified.json()
+        with main.connect() as db:
+            row = db.execute(
+                "SELECT setting_value FROM app_settings WHERE setting_key='drive_verified_folder_id'"
+            ).fetchone()
+        assert row["setting_value"] == "test-private-folder-id"
 
 
 def test_researcher_upload_review_export_and_delete(monkeypatch):
@@ -54,6 +95,9 @@ def test_researcher_upload_review_export_and_delete(monkeypatch):
         assert deleted.status_code == 200
         assert deletions == ["drive-private-id"]
         assert client.get("/api/admin/photos").json() == []
+        with main.connect() as db:
+            assert db.execute("SELECT COUNT(*) AS count FROM photos WHERE photo_id=?", (photo_id,)).fetchone()["count"] == 0
+            assert db.execute("SELECT COUNT(*) AS count FROM annotation_history WHERE photo_id=?", (photo_id,)).fetchone()["count"] == 0
 
 
 def test_upload_rejects_invalid_image_and_consent(monkeypatch):
@@ -67,6 +111,21 @@ def test_upload_rejects_invalid_image_and_consent(monkeypatch):
         assert oversized.status_code == 413
         declined = client.post("/api/submissions", headers={**headers, "Idempotency-Key":"attempt-declined-123"}, data={"consent_confirmed":"false", "adult_confirmed":"true", "consent_version":main.settings.consent_version, "consent_id":"consent-declined-1"}, files={"image":("test.jpg", make_image(), "image/jpeg")})
         assert declined.status_code == 400
+
+
+def test_disabled_collection_rejects_submission_before_storage(monkeypatch):
+    monkeypatch.setattr(main, "settings", replace(main.settings, collection_enabled=False))
+    uploads = []
+    monkeypatch.setattr(main.drive, "upload_photo", lambda *args: uploads.append(args))
+    with TestClient(main.app) as client:
+        response = client.post(
+            "/api/submissions",
+            headers={"Origin": "http://testserver", "Idempotency-Key": "closed-collection-test"},
+            data={"consent_confirmed": "true", "adult_confirmed": "true", "consent_version": main.settings.consent_version, "consent_id": "closed-consent-test"},
+            files={"image": ("test.jpg", make_image(), "image/jpeg")},
+        )
+    assert response.status_code == 503
+    assert uploads == []
 
 
 def test_origin_and_authentication_are_required():

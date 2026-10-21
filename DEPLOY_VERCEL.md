@@ -40,6 +40,10 @@ Enable **Access to System Environment Variables** in this settings page so Verce
 | `CONSENT_VERSION` | The version participants will accept on the hosted site |
 | `MINIMUM_AGE` | `18` |
 
+Collection stays closed unless the consent contact is real, the retention wording is explicitly configured (the stock default is rejected), the minimum age is at least 18, and consent version is present. In Production it also requires PostgreSQL, Google OAuth credentials, a valid Drive token, and a private Drive folder that an authorized researcher has verified from the dashboard. Successful verification records the folder ID; reconnecting Drive clears that verification and requires another check. Keep `COLLECTION_ENABLED=false` until all of these checks and the participant information are accurate.
+
+The participant text now discloses the Neon database and Vercel hosting. Before reopening collection, review the wording for the study and increment `CONSENT_VERSION` so future submissions record the updated notice. The application does not enforce an automatic retention schedule; use wording that matches the study owner's actual deletion process.
+
 Do not set `GOOGLE_TOKEN_FILE` for Vercel. When `DATABASE_URL` is PostgreSQL, the app stores the Drive token encrypted in the `app_settings` table using `APP_SECRET_KEY`. Keep that key stable: changing it invalidates researcher sessions and prevents decrypting the saved Drive token; reconnect Drive after rotating it.
 
 The production callback and allowed site origin default to the Vercel system value `VERCEL_PROJECT_PRODUCTION_URL`. You can set `GOOGLE_OAUTH_REDIRECT_URI` and `ALLOWED_ORIGIN` explicitly if you attach a custom domain.
@@ -84,7 +88,7 @@ If you do not need to retain local submissions, skip the migration; the hosted a
 
 3. In Google Cloud Console, add that exact URL under the Web OAuth client's **Authorized redirect URIs**. Keep the local callback there too if you still use the local app.
 4. Return to the deployed dashboard, choose **Connect Google Drive**, sign in to the Drive-owning Google account, and approve `drive.file`. Verify the private folder before enabling collection.
-5. Check the deployed public page, consent wording, upload, researcher preview, annotations, deletion, and CSV export. Only then set `COLLECTION_ENABLED=true` and redeploy.
+5. Check the deployed public page, consent wording, researcher preview, annotations, deletion, and CSV export. The production readiness API will remain false until the study contact and retention wording are configured, the Drive folder has passed the dashboard verification check, and all storage/authentication requirements are met. Only then set `COLLECTION_ENABLED=true` and redeploy.
 
 If the OAuth consent screen remains in Testing, Google may expire the refresh token after seven days; reconnect Drive when that happens or complete Google's publication/verification process for the study.
 
@@ -92,5 +96,6 @@ If the OAuth consent screen remains in Testing, Google may expire the refresh to
 
 - Vercel Functions limit each request body to 4.5 MB. The Vercel configuration uses a 4,000,000-byte photo limit to leave room for multipart form fields. Local Docker development retains its 5 MB default.
 - The photo binaries remain in the researcher's private Google Drive. They are not stored in Vercel Blob or served by public Drive links.
+- The application does not run scheduled retention deletion. Set only a truthful retention statement and have the study owner follow that policy; separately exported CSV copies are outside the app's deletion control.
 - This deployment uses Neon PostgreSQL through the Vercel Marketplace; Vercel does not provide its own new-project Postgres service. Keep the Neon integration connected and monitor its free-plan limits and Vercel Hobby usage.
 - Vercel can run the FastAPI application and serve the Vite build, but this is a small-study deployment. Back up the Neon database and keep a separate copy of `APP_SECRET_KEY` in a password manager; without it, the encrypted Drive token cannot be recovered.

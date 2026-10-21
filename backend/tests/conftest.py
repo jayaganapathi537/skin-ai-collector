@@ -10,7 +10,8 @@ os.environ.update({
     "RESEARCHER_USERNAME": "test-researcher",
     "RESEARCHER_PASSWORD_HASH": PasswordHasher().hash("test-password-12345"),
     "COLLECTION_ENABLED": "true",
-    "CONSENT_CONTACT": "test-owner@example.test",
+    "CONSENT_CONTACT": "test-owner@study.invalid",
+    "RETENTION_POLICY": "Test records are deleted at the end of this isolated test run.",
     "ALLOWED_ORIGIN": "http://testserver",
     "GOOGLE_TOKEN_FILE": os.path.join(tempfile.gettempdir(), "skin-ai-test-token.json"),
 })
